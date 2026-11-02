@@ -19,11 +19,15 @@ html,body{margin:0;height:100%;background:#1a1108;overflow:hidden;overscroll-beh
 #msg.off{opacity:0}
 #msg small{display:block;font-weight:500;font-size:12px;letter-spacing:.24em;opacity:.8}
 #hap{position:fixed;left:-200px;top:0;opacity:0;pointer-events:none}
+#acc{position:fixed;transform:translate(0,-55%);pointer-events:none;font-family:"Zen Kaku Gothic New",system-ui,sans-serif;font-weight:700;
+  font-size:22px;color:#fff1cf;text-shadow:0 0 12px rgba(255,170,70,.9);opacity:0;transition:opacity .12s}
+#acc.on{opacity:1}
 </style>
 </head>
 <body>
 <canvas id="gl"></canvas>
 <div id="msg">触れて、はじめる</div>
+<div id="acc"></div>
 <label id="hap" aria-hidden="true"><input type="checkbox" switch tabindex="-1"></label>
 
 <script id="fs" type="x-shader/x-fragment">
@@ -33,8 +37,8 @@ uniform float uDpr;
 uniform float uTime;
 uniform vec2 uTilt;
 uniform float uWake;
-uniform vec4 uKey[8];   // x, y (device px, top-left origin), radius, press
-uniform float uGlow[8];
+uniform vec4 uKey[12];  // x, y (device px, top-left origin), radius, press
+uniform float uGlow[12];
 uniform vec4 uRod;      // x, y0, y1, radius
 uniform vec4 uSrc;      // x, y, amp
 uniform sampler2D uEng;
@@ -86,13 +90,13 @@ void main(){
     else ao *= 1.0 - 0.35 * exp(-pow((d - pr) / (5.0 * s), 2.0));
   }
 
-  for (int i = 0; i < 8; i++) {
+  for (int i = 0; i < 12; i++) {
     vec4 k = uKey[i];
     float r = k.z;
     vec2 d2 = p - k.xy; float d = length(d2);
     // arm from the rod to the key cup
-    if (i < 6) {
-      float ht = 2.4 * s;
+    if (i < 10) {
+      float ht = 2.0 * s;
       if (p.x > rx && p.x < k.x - r && abs(d2.y) < ht) { float t = d2.y / ht; n = vec3(0.0, -t * 1.1, sqrt(max(0.0, 1.0 - t * t))); }
       if (p.x > rx && p.x < k.x - r && d2.y > ht && d2.y < ht + 6.0 * s) ao *= 1.0 - 0.3 * (1.0 - (d2.y - ht) / (6.0 * s));
     }
@@ -168,8 +172,10 @@ const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const DEG = Math.PI / 180;
 const mtof = m => 440 * Math.pow(2, (m - 69) / 12);
 
-// D minor pentatonic, bottom key to top key, middle register
-const NOTES = [62, 65, 67, 69, 72, 74];
+// C major, bottom key to top key (ド to the next octave's ミ), middle register
+const NOTES = [60, 62, 64, 65, 67, 69, 71, 72, 74, 76];
+const NAMES = ['ド', 'レ', 'ミ', 'ファ', 'ソ', 'ラ', 'シ', 'ド', 'レ', 'ミ'];
+const NK = NOTES.length;
 
 /* ================= sound ================= */
 function makeSaxWave(ctx) {
@@ -331,29 +337,39 @@ function updateReg() {
     if (Math.abs(rp - reg) > 0.62) reg = clamp(Math.round(rp), 0, 2);
   } else { reg = manualReg; rp = reg; }
 }
-function bend() {
-  if (!T.seen) return 0;
-  const r = -T.rollS, a = Math.abs(r);
-  if (a < 8) return 0;
-  return Math.sign(r) * Math.pow(clamp((a - 8) / 24, 0, 1), 1.2) * 2;
+// twist clockwise for a sharp, counter-clockwise for a flat (snapped, with hysteresis)
+let acc = 0;
+function updateAcc() {
+  if (!T.seen) { acc = 0; return; }
+  const r = -T.rollS;
+  if (acc === 0) { if (r > 16) acc = 1; else if (r < -16) acc = -1; }
+  else if (acc * r < 10) acc = (Math.abs(r) > 16) ? Math.sign(r) : 0;
 }
 function breathNow() { return 0.6 + 0.2 * (1 - Math.exp(-(performance.now() - phraseStart) / 1100)); }
 function compute() {
   updateReg();
-  const held = [...P.values()].filter(p => p.key >= 0 && p.key < 6);
+  updateAcc();
+  const held = [...P.values()].filter(p => p.key >= 0 && p.key < NK);
   const gate = held.length > 0;
   let k = cur.key;
   if (gate) k = held.reduce((a, p) => (!a || p.t > a.t) ? p : a, null).key;
   if (gate && !cur.gate) phraseStart = performance.now();
-  const midi = NOTES[5 - k] + 12 * (reg - 1);
-  cur = { gate, midi, key: k, bend: bend(), breath: gate ? breathNow() : cur.breath };
+  const midi = NOTES[NK - 1 - k] + 12 * (reg - 1) + acc;
+  cur = { gate, midi, key: k, bend: 0, breath: gate ? breathNow() : cur.breath };
+  showAcc();
   if (audio.ready) audio.sax.update({ gate, midi, breath: cur.breath, bend: cur.bend, tongue: tongue && gate });
   tongue = false;
 }
+const accEl = document.getElementById('acc');
+function showAcc() {
+  const on = cur.gate && acc !== 0;
+  accEl.classList.toggle('on', on);
+  if (on) { const k = keys[cur.key]; accEl.textContent = acc > 0 ? '♯' : '♭'; accEl.style.left = (k.x - k.r * 1.33 - 30) + 'px'; accEl.style.top = k.y + 'px'; }
+}
 function keyAt(x, y) {
-  for (let i = 6; i < 8; i++) { const k = keys[i]; if (!T.seen && Math.hypot(x - k.x, y - k.y) < k.r * 2.6) return i; }
+  for (let i = NK; i < NK + 2; i++) { const k = keys[i]; if (!T.seen && Math.hypot(x - k.x, y - k.y) < k.r * 2.6) return i; }
   let best = -1, bd = 1e9;
-  for (let i = 0; i < 6; i++) {
+  for (let i = 0; i < NK; i++) {
     const k = keys[i], dy = Math.abs(y - k.y), dx = Math.abs(x - k.x);
     if (dx < Math.max(k.r * 3, innerWidth * 0.42) && dy < spacing * 0.75 && dy < bd) { bd = dy; best = i; }
   }
@@ -367,13 +383,13 @@ let W = 0, H = 0, dpr = 1;
 function layout() {
   dpr = Math.min(2, window.devicePixelRatio || 1); W = innerWidth; H = innerHeight;
   cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
-  const s = spacing = Math.min(H * 0.105, 104), r = Math.min(s * 0.39, W * 0.115, 38), gap = s * 0.6, cx = W * 0.58;
-  const span = 5 * s + gap, y0 = H * 0.5 - span / 2 + H * 0.01;
+  const s = spacing = Math.min(H * 0.76 / (NK - 1 + 0.45 + 1.8), 84), r = Math.min(s * 0.37, W * 0.1, 32), gap = s * 0.45, cx = W * 0.56;
+  const span = (NK - 1) * s + gap, y0 = H * 0.5 - span / 2;
   keys.length = 0;
-  for (let i = 0; i < 6; i++) keys.push({ x: cx, y: y0 + i * s + (i >= 3 ? gap : 0), r });
-  keys.push({ x: cx + r * 0.2, y: y0 - s * 1.05, r: r * 0.42 });           // high register (palm key)
-  keys.push({ x: cx - r * 0.1, y: keys[5].y + s * 1.05, r: r * 0.42 });    // low register
-  rod = { x: cx - r * 2.1, y0: y0 - s * 0.42, y1: keys[5].y + s * 0.42, r: 4.2 };
+  for (let i = 0; i < NK; i++) keys.push({ x: cx, y: y0 + i * s + (i >= 5 ? gap : 0), r });
+  keys.push({ x: cx + r * 0.25, y: y0 - s * 0.95, r: Math.max(9, r * 0.45) });            // high register (palm key)
+  keys.push({ x: cx - r * 0.1, y: keys[NK - 1].y + s * 0.95, r: Math.max(9, r * 0.45) }); // low register
+  rod = { x: cx - r * 2.2, y0: y0 - s * 0.4, y1: keys[NK - 1].y + s * 0.4, r: 3.6 };
   drawEngraving();
   if (gl) gl.viewport(0, 0, cv.width, cv.height);
 }
@@ -395,6 +411,11 @@ function drawEngraving() {
     x.bezierCurveTo(ex + 98, ey + 21, ex + 98, ey + 12, ex + 104, ey + 12);
     x.stroke();
     x.font = `12px ${fam}`; x.fillText('tilt saxophone', ex + 4, ey + 34);
+    for (let i = 0; i < NK; i++) {
+      const k = keys[i], nm = NAMES[NK - 1 - i], root = nm === 'ド';
+      x.font = `${root ? 700 : 500} ${Math.round(clamp(k.r * 0.72, 11, 16))}px "Zen Kaku Gothic New", system-ui, sans-serif`;
+      x.textBaseline = 'middle'; x.fillText(nm, k.x + k.r * 1.33 + 10, k.y + 1);
+    }
   });
   x.restore();
   if (gl) { gl.bindTexture(gl.TEXTURE_2D, tex); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c); }
@@ -423,7 +444,7 @@ else {
   gl.uniform1i(U.uEng, 0);
 }
 
-const press = new Float32Array(8), glow = new Float32Array(8), keyBuf = new Float32Array(32);
+const press = new Float32Array(12), glow = new Float32Array(12), keyBuf = new Float32Array(48);
 const V = { tilt: [0, 0], wake: 0.38, wakeT: 0.38, level: 0, src: [0, 0, 0] };
 let started = false;
 function frame(ts) {
@@ -439,12 +460,12 @@ function frame(ts) {
   else { tx = Math.sin(t * 0.31) * 0.16 + Math.sin(t * 0.13) * 0.08; ty = Math.cos(t * 0.23) * 0.12; }
   V.tilt[0] += (tx - V.tilt[0]) * 0.18; V.tilt[1] += (ty - V.tilt[1]) * 0.18;
   const held = new Set([...P.values()].map(p => p.key));
-  for (let i = 0; i < 8; i++) {
+  for (let i = 0; i < NK + 2; i++) {
     const pt = held.has(i) ? 1 : 0;
     press[i] += (pt - press[i]) * (pt ? 0.5 : 0.22);
-    let gt = (i < 6 && cur.gate && cur.key === i) ? clamp(0.45 + V.level * 3.2, 0, 1) : 0;
-    if (i === 6 && reg === 2) gt = Math.max(gt, 0.9);
-    if (i === 7 && reg === 0) gt = Math.max(gt, 0.9);
+    let gt = (i < NK && cur.gate && cur.key === i) ? clamp(0.45 + V.level * 3.2, 0, 1) : 0;
+    if (i === NK && reg === 2) gt = Math.max(gt, 0.9);
+    if (i === NK + 1 && reg === 0) gt = Math.max(gt, 0.9);
     glow[i] += (gt - glow[i]) * (gt > glow[i] ? 0.35 : 0.08);
     const k = keys[i]; keyBuf.set([k.x * dpr, k.y * dpr, k.r * dpr, press[i]], i * 4);
   }
@@ -463,7 +484,7 @@ function frame(ts) {
 let hintTimer = 0, hinted = false;
 function showHint() {
   const m = $('#msg');
-  m.innerHTML = T.seen ? '左手で構えて、右手で真珠を押さえる<small>持ち上げると高い音、ひねると音がしなる</small>'
+  m.innerHTML = T.seen ? '左手で構えて、右手で真珠を押さえる<small>持ち上げると1オクターブ上、ひねると半音上下</small>'
                        : '真珠を押さえて吹く<small>上下の小さな真珠で音域を変える</small>';
   m.classList.remove('off');
   clearTimeout(hintTimer); hintTimer = setTimeout(() => m.classList.add('off'), 5200);
@@ -483,16 +504,16 @@ cv.addEventListener('pointerdown', e => {
   audio.wake();
   try { cv.setPointerCapture(e.pointerId); } catch (err) {}
   const k = keyAt(e.clientX, e.clientY);
-  if (k === 6 || k === 7) { manualReg = clamp(manualReg + (k === 6 ? 1 : -1), 0, 2); P.set(e.pointerId, { key: k, t: performance.now() }); haptic(); compute(); return; }
-  const wasSounding = [...P.values()].some(p => p.key >= 0 && p.key < 6);
+  if (k === NK || k === NK + 1) { manualReg = clamp(manualReg + (k === NK ? 1 : -1), 0, 2); P.set(e.pointerId, { key: k, t: performance.now() }); haptic(); compute(); return; }
+  const wasSounding = [...P.values()].some(p => p.key >= 0 && p.key < NK);
   P.set(e.pointerId, { key: k, t: performance.now() });
   if (k >= 0) { if (wasSounding) tongue = true; haptic(); }
   compute();
 }, { passive: false });
 cv.addEventListener('pointermove', e => {
-  const p = P.get(e.pointerId); if (!p || p.key >= 6 || p.key < 0) return;
+  const p = P.get(e.pointerId); if (!p || p.key >= NK || p.key < 0) return;
   const k = keyAt(e.clientX, e.clientY);
-  if (k >= 0 && k < 6 && k !== p.key) { p.key = k; p.t = performance.now(); compute(); }
+  if (k >= 0 && k < NK && k !== p.key) { p.key = k; p.t = performance.now(); compute(); }
 });
 const end = e => { if (P.delete(e.pointerId)) compute(); };
 cv.addEventListener('pointerup', end); cv.addEventListener('pointercancel', end); cv.addEventListener('lostpointercapture', end);
@@ -506,12 +527,12 @@ document.addEventListener('visibilitychange', () => {
 // keyboard for desk testing: 1-6 play keys, arrows change register
 window.addEventListener('keydown', e => {
   if (!started) return;
-  const i = '123456'.indexOf(e.key);
-  if (i >= 0 && !P.has('k' + i)) { const was = [...P.values()].some(p => p.key >= 0 && p.key < 6); P.set('k' + i, { key: 5 - i, t: performance.now() }); if (was) tongue = true; compute(); }
+  const i = '1234567890'.indexOf(e.key);
+  if (i >= 0 && !P.has('k' + i)) { const was = [...P.values()].some(p => p.key >= 0 && p.key < NK); P.set('k' + i, { key: NK - 1 - i, t: performance.now() }); if (was) tongue = true; compute(); }
   if (e.key === 'ArrowUp') { manualReg = clamp(manualReg + 1, 0, 2); compute(); }
   if (e.key === 'ArrowDown') { manualReg = clamp(manualReg - 1, 0, 2); compute(); }
 });
-window.addEventListener('keyup', e => { const i = '123456'.indexOf(e.key); if (i >= 0 && P.delete('k' + i)) compute(); });
+window.addEventListener('keyup', e => { const i = '1234567890'.indexOf(e.key); if (i >= 0 && P.delete('k' + i)) compute(); });
 
 window.addEventListener('resize', layout);
 if (screen.orientation) screen.orientation.addEventListener('change', () => setTimeout(layout, 120));
