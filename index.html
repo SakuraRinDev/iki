@@ -13,7 +13,7 @@
 html,body{margin:0;height:100%;background:#1a1108;overflow:hidden;overscroll-behavior:none;
   -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-tap-highlight-color:transparent}
 #gl{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none}
-#msg{position:fixed;top:22%;left:calc(env(safe-area-inset-left,0px) + 18px);writing-mode:vertical-rl;pointer-events:none;
+#msg{position:fixed;top:16%;right:calc(env(safe-area-inset-right,0px) + 12px);writing-mode:vertical-rl;pointer-events:none;
   font-family:"Zen Kaku Gothic New",system-ui,sans-serif;font-weight:700;font-size:14px;line-height:2.1;letter-spacing:.28em;
   color:rgba(255,226,160,.62);text-shadow:0 -1px 0 rgba(0,0,0,.55);transition:opacity 1.2s ease}
 #msg.off{opacity:0}
@@ -28,7 +28,6 @@ html,body{margin:0;height:100%;background:#1a1108;overflow:hidden;overscroll-beh
 <canvas id="gl"></canvas>
 <div id="msg">触れて、はじめる</div>
 <div id="acc"></div>
-<label id="hap" aria-hidden="true"><input type="checkbox" switch tabindex="-1"></label>
 
 <script id="fs" type="x-shader/x-fragment">
 precision highp float;
@@ -232,7 +231,7 @@ class Sax {
     o.start(); ns.start(); this.vib.start(); this.gl.start();
     this.gate = false; this.midi = 62; this.b = -1; this.bend = 0; this.artUntil = 0;
   }
-  level(b, midi) { return (0.05 + 0.40 * Math.pow(b, 1.6)) * (1 - 0.18 * clamp((midi - 62) / 24, 0, 1)); }
+  level(b, midi) { return (0.05 + 0.40 * Math.pow(b, 1.6)) * (1 - 0.18 * clamp((midi - 62) / 24, 0, 1)) * (this.scale || 1); }
   applyBreath(b, midi, t, force) {
     if (!force && Math.abs(b - this.b) < 0.006) return;
     this.b = b;
@@ -252,7 +251,10 @@ class Sax {
   scoopFrom(t, cents, tc) { if (!this.scoop) return; const p = this.scoop.offset; p.cancelScheduledValues(t); p.setValueAtTime(cents, t); p.setTargetAtTime(0, t + 0.005, tc); }
   vibStart(t, b) { const p = this.vibDepth.gain; p.cancelScheduledValues(t); p.setTargetAtTime(0, t, 0.02); p.setTargetAtTime(13 + 9 * b, t + 0.32, 0.3); }
   update(s) {
-    const t = this.ctx.currentTime, f = mtof(s.midi), L = this.level(s.breath, s.midi);
+    const t = this.ctx.currentTime, f = mtof(s.midi);
+    const rescale = s.scale != null && s.scale !== this.scale; if (s.scale != null) this.scale = s.scale;
+    const L = this.level(s.breath, s.midi);
+    if (rescale && this.gate && s.gate) this.amp.gain.setTargetAtTime(L, t, 0.03);
     if (s.gate && !this.gate) {
       this.osc.frequency.setValueAtTime(f, t); this.gate = true;
       this.applyBreath(s.breath, s.midi, t, true);
@@ -273,7 +275,7 @@ class Sax {
   }
 }
 const audio = {
-  ready: false,
+  ready: false, voices: [],
   init() {
     if (this.ready) { this.wake(); return; }
     const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
@@ -286,7 +288,8 @@ const audio = {
     const bus = ctx.createGain(); bus.gain.value = .9; bus.connect(comp);
     const send = ctx.createGain(); send.gain.value = .3; bus.connect(send).connect(rev);
     this.an = ctx.createAnalyser(); this.an.fftSize = 512; bus.connect(this.an); this.buf = new Uint8Array(512);
-    this.sax = new Sax(ctx, bus, makeNoise(ctx, 2));
+    const noise = makeNoise(ctx, 2);
+    for (let i = 0; i < VOICES; i++) this.voices.push(new Sax(ctx, bus, noise));
     this.ready = true;
     try { const b = ctx.createBuffer(1, 1, 22050), s = ctx.createBufferSource(); s.buffer = b; s.connect(ctx.destination); s.start(0); } catch (e) {}
     this.wake();
@@ -299,9 +302,10 @@ const audio = {
     return Math.sqrt(s / this.buf.length);
   }
 };
+const VOICES = 4;
 
 /* ================= tilt ================= */
-const T = { listening: false, seen: false, center: null, elevS: 0, rollS: 0 };
+const T = { asked: false, listening: false, denied: false, seen: false, center: null, elevS: 0, rollS: 0 };
 function onOrient(e) {
   if (e.beta == null || e.gamma == null) return;
   const b = e.beta * DEG, gm = e.gamma * DEG;
@@ -313,52 +317,75 @@ function onOrient(e) {
   if (!T.seen) { T.seen = true; T.elevS = elev; T.rollS = roll; if (T.center == null) T.center = elev; showHint(); }
   T.elevS += (elev - T.elevS) * 0.35;
   T.rollS += (roll - T.rollS) * 0.35;
-  const tl = T.elevS - T.center;
-  if (Math.abs(tl) < 5 && !cur.gate) T.center += (T.elevS - T.center) * 0.004;   // follow slow posture drift
+  if (Math.abs(T.elevS - T.center) < 6 && !cur.gate) T.center += (T.elevS - T.center) * 0.004;   // follow slow posture drift
   compute();
 }
+// iOS only grants the sensor from a tap that has ended (touchend / click), so this runs from touchend
 function requestGyro() {
   const DOE = window.DeviceOrientationEvent;
+  if (!DOE || T.listening || T.denied) return;
   const attach = () => { if (!T.listening) { window.addEventListener('deviceorientation', onOrient); T.listening = true; } };
-  if (!DOE) return;
-  if (typeof DOE.requestPermission === 'function') DOE.requestPermission().then(s => { if (s === 'granted') attach(); }).catch(() => {});
-  else attach();
+  if (typeof DOE.requestPermission === 'function') {
+    T.asked = true;
+    DOE.requestPermission().then(s => { if (s === 'granted') attach(); else { T.denied = true; showHint(); } }).catch(() => {});
+  } else attach();
 }
 
 /* ================= playing ================= */
-const P = new Map();
-let reg = 1, manualReg = 1, rp = 1, tongue = false, phraseStart = 0;
-let cur = { gate: false, midi: 62, key: 0, bend: 0, breath: 0.6 };
-const keys = []; let rod = {}, spacing = 80;
+const P = new Map();            // touch id -> { key, voice, t }
+let oct = 0, acc = 0, phraseStart = 0;
+let cur = { gate: false, midi: 60, key: 0, keys: [], breath: 0.6 };
+const keys = []; let rod = {}, spacing = 60, octSplit = 0;
+const OCT_UP = NK, OCT_DOWN = NK + 1;
 
-function updateReg() {
-  if (T.seen) {
-    rp = clamp(1 + (T.elevS - T.center) / 13, 0, 2);
-    if (Math.abs(rp - reg) > 0.62) reg = clamp(Math.round(rp), 0, 2);
-  } else { reg = manualReg; rp = reg; }
-}
 // twist clockwise for a sharp, counter-clockwise for a flat (snapped, with hysteresis)
-let acc = 0;
 function updateAcc() {
   if (!T.seen) { acc = 0; return; }
   const r = -T.rollS;
   if (acc === 0) { if (r > 16) acc = 1; else if (r < -16) acc = -1; }
   else if (acc * r < 10) acc = (Math.abs(r) > 16) ? Math.sign(r) : 0;
 }
-function breathNow() { return 0.6 + 0.2 * (1 - Math.exp(-(performance.now() - phraseStart) / 1100)); }
+function breathNow() {
+  // lifting the bell plays louder and brighter; without the sensor, each phrase swells a little
+  if (T.seen) return clamp(0.64 + (T.elevS - T.center) / 40 * 0.4, 0.36, 1.0);
+  return 0.6 + 0.2 * (1 - Math.exp(-(performance.now() - phraseStart) / 1100));
+}
 function compute() {
-  updateReg();
   updateAcc();
-  const held = [...P.values()].filter(p => p.key >= 0 && p.key < NK);
-  const gate = held.length > 0;
-  let k = cur.key;
-  if (gate) k = held.reduce((a, p) => (!a || p.t > a.t) ? p : a, null).key;
+  const all = [...P.values()];
+  oct = (all.some(p => p.key === OCT_UP) ? 1 : 0) - (all.some(p => p.key === OCT_DOWN) ? 1 : 0);
+  const notes = all.filter(p => p.key >= 0 && p.key < NK).sort((a, b) => a.t - b.t);
+  const gate = notes.length > 0;
   if (gate && !cur.gate) phraseStart = performance.now();
-  const midi = NOTES[NK - 1 - k] + 12 * (reg - 1) + acc;
-  cur = { gate, midi, key: k, bend: 0, breath: gate ? breathNow() : cur.breath };
+  const breath = gate ? breathNow() : cur.breath;
+  const scale = notes.length > 1 ? 1.1 / Math.sqrt(notes.length) : 1;
+  const midiOf = k => NOTES[NK - 1 - k] + 12 * oct + acc;
+  if (audio.ready) {
+    for (let v = 0; v < VOICES; v++) {
+      const p = notes.find(q => q.voice === v), sx = audio.voices[v];
+      if (p) sx.update({ gate: true, midi: midiOf(p.key), breath, bend: 0, scale });
+      else if (sx.gate) sx.update({ gate: false, midi: sx.midi, breath, bend: 0, scale });
+    }
+  }
+  const newest = notes[notes.length - 1];
+  cur = { gate, key: newest ? newest.key : cur.key, keys: notes.map(p => p.key), midi: newest ? midiOf(newest.key) : cur.midi, breath };
   showAcc();
-  if (audio.ready) audio.sax.update({ gate, midi, breath: cur.breath, bend: cur.bend, tongue: tongue && gate });
-  tongue = false;
+}
+function freeVoice() {
+  const used = new Set([...P.values()].filter(p => p.voice != null).map(p => p.voice));
+  for (let v = 0; v < VOICES; v++) if (!used.has(v)) return v;
+  // all busy: take over the oldest finger's voice
+  const oldest = [...P.values()].filter(p => p.voice != null).sort((a, b) => a.t - b.t)[0];
+  const v = oldest.voice; oldest.voice = null; oldest.key = -1; return v;
+}
+function keyAt(x, y) {
+  if (x < rod.x - 10) return y < octSplit ? OCT_UP : OCT_DOWN;   // left thumb: octave keys
+  let best = -1, bd = 1e9;
+  for (let i = 0; i < NK; i++) {
+    const dy = Math.abs(y - keys[i].y);
+    if (dy < spacing * 0.75 && dy < bd) { bd = dy; best = i; }
+  }
+  return best;
 }
 const accEl = document.getElementById('acc');
 function showAcc() {
@@ -366,56 +393,54 @@ function showAcc() {
   accEl.classList.toggle('on', on);
   if (on) { const k = keys[cur.key]; accEl.textContent = acc > 0 ? '♯' : '♭'; accEl.style.left = (k.x - k.r * 1.33 - 30) + 'px'; accEl.style.top = k.y + 'px'; }
 }
-function keyAt(x, y) {
-  for (let i = NK; i < NK + 2; i++) { const k = keys[i]; if (!T.seen && Math.hypot(x - k.x, y - k.y) < k.r * 2.6) return i; }
-  let best = -1, bd = 1e9;
-  for (let i = 0; i < NK; i++) {
-    const k = keys[i], dy = Math.abs(y - k.y), dx = Math.abs(x - k.x);
-    if (dx < Math.max(k.r * 3, innerWidth * 0.42) && dy < spacing * 0.75 && dy < bd) { bd = dy; best = i; }
-  }
-  return best;
-}
-const hapEl = document.getElementById('hap');
-function haptic() { try { if (navigator.vibrate) navigator.vibrate(7); else hapEl.click(); } catch (e) {} }
+function haptic() { try { if (navigator.vibrate) navigator.vibrate(7); } catch (e) {} }
 
 /* ================= layout ================= */
 let W = 0, H = 0, dpr = 1;
 function layout() {
   dpr = Math.min(2, window.devicePixelRatio || 1); W = innerWidth; H = innerHeight;
   cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
-  const s = spacing = Math.min(H * 0.76 / (NK - 1 + 0.45 + 1.8), 84), r = Math.min(s * 0.37, W * 0.1, 32), gap = s * 0.45, cx = W * 0.56;
+  const s = spacing = Math.min(H * 0.8 / (NK - 1 + 0.45), 84), r = Math.min(s * 0.37, W * 0.1, 32), gap = s * 0.45, cx = W * 0.62;
   const span = (NK - 1) * s + gap, y0 = H * 0.5 - span / 2;
   keys.length = 0;
   for (let i = 0; i < NK; i++) keys.push({ x: cx, y: y0 + i * s + (i >= 5 ? gap : 0), r });
-  keys.push({ x: cx + r * 0.25, y: y0 - s * 0.95, r: Math.max(9, r * 0.45) });            // high register (palm key)
-  keys.push({ x: cx - r * 0.1, y: keys[NK - 1].y + s * 0.95, r: Math.max(9, r * 0.45) }); // low register
   rod = { x: cx - r * 2.2, y0: y0 - s * 0.4, y1: keys[NK - 1].y + s * 0.4, r: 3.6 };
+  // octave keys under the left thumb
+  const ox = Math.max(44, rod.x * 0.42), orr = clamp(W * 0.075, 22, 32), mid = H * 0.53, off = Math.max(orr * 2.1, H * 0.085);
+  keys.push({ x: ox, y: mid - off, r: orr });
+  keys.push({ x: ox, y: mid + off, r: orr });
+  octSplit = mid;
   drawEngraving();
   if (gl) gl.viewport(0, 0, cv.width, cv.height);
 }
 function drawEngraving() {
   const c = engCanvas, w = c.width = Math.round(W * dpr), h = c.height = Math.round(H * dpr), x = c.getContext('2d');
   x.clearRect(0, 0, w, h); x.save(); x.scale(dpr, dpr);
-  const ex = W * 0.06, ey = H - Math.max(70, H * 0.12);
+  const ex = W * 0.06, ey = H - Math.max(70, H * 0.11);
   const fam = '"Pinyon Script", "Snell Roundhand", "Apple Chancery", cursive';
+  const jp = '"Zen Kaku Gothic New", system-ui, sans-serif';
   const groove = (fn) => { x.fillStyle = x.strokeStyle = 'rgb(0,255,0)'; x.save(); x.translate(0, 1.2); fn(); x.restore(); x.fillStyle = x.strokeStyle = 'rgb(255,0,0)'; fn(); };
   x.globalCompositeOperation = 'lighter';
   groove(() => {
-    x.font = `${Math.round(Math.min(W * 0.13, 54))}px ${fam}`; x.textBaseline = 'alphabetic';
+    x.font = `${Math.round(Math.min(W * 0.13, 54))}px ${fam}`; x.textBaseline = 'alphabetic'; x.textAlign = 'left';
     x.fillText('Iki', ex, ey);
     x.lineWidth = 1.1; x.lineCap = 'round';
-    // a single scroll flourish under the mark
     x.beginPath(); x.moveTo(ex - 4, ey + 12);
     x.bezierCurveTo(ex + 30, ey + 2, ex + 60, ey + 24, ex + 96, ey + 10);
     x.bezierCurveTo(ex + 112, ey + 4, ex + 118, ey + 18, ex + 106, ey + 20);
     x.bezierCurveTo(ex + 98, ey + 21, ex + 98, ey + 12, ex + 104, ey + 12);
     x.stroke();
     x.font = `12px ${fam}`; x.fillText('tilt saxophone', ex + 4, ey + 34);
+    x.textBaseline = 'middle';
     for (let i = 0; i < NK; i++) {
       const k = keys[i], nm = NAMES[NK - 1 - i], root = nm === 'ド';
-      x.font = `${root ? 700 : 500} ${Math.round(clamp(k.r * 0.72, 11, 16))}px "Zen Kaku Gothic New", system-ui, sans-serif`;
-      x.textBaseline = 'middle'; x.fillText(nm, k.x + k.r * 1.33 + 10, k.y + 1);
+      x.font = `${root ? 700 : 500} ${Math.round(clamp(k.r * 0.72, 11, 16))}px ${jp}`;
+      x.fillText(nm, k.x + k.r * 1.33 + 10, k.y + 1);
     }
+    const up = keys[OCT_UP], dn = keys[OCT_DOWN];
+    x.textAlign = 'center'; x.font = `700 12px ${jp}`;
+    x.fillText('オクターブ上', up.x, up.y - up.r * 1.33 - 16);
+    x.fillText('オクターブ下', dn.x, dn.y + dn.r * 1.33 + 16);
   });
   x.restore();
   if (gl) { gl.bindTexture(gl.TEXTURE_2D, tex); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c); }
@@ -451,21 +476,20 @@ function frame(ts) {
   requestAnimationFrame(frame);
   if (!gl) return;
   const t = ts / 1000;
-  if (cur.gate) { const b = breathNow(); if (Math.abs(b - cur.breath) > 0.006) { cur.breath = b; if (audio.ready) audio.sax.update({ gate: true, midi: cur.midi, breath: b, bend: cur.bend }); } }
+  if (cur.gate) { const b = breathNow(); if (Math.abs(b - cur.breath) > 0.006) compute(); }
   V.level += (audio.level() - V.level) * 0.25;
   V.wake += (V.wakeT - V.wake) * 0.035;
-  // light follows the hand when the sensor is live, otherwise it drifts slowly
   let tx, ty;
   if (T.seen) { tx = clamp(-T.rollS / 40, -1, 1) * 0.55; ty = clamp((T.elevS - T.center) / 40, -1, 1) * 0.55; }
   else { tx = Math.sin(t * 0.31) * 0.16 + Math.sin(t * 0.13) * 0.08; ty = Math.cos(t * 0.23) * 0.12; }
   V.tilt[0] += (tx - V.tilt[0]) * 0.18; V.tilt[1] += (ty - V.tilt[1]) * 0.18;
   const held = new Set([...P.values()].map(p => p.key));
+  const sounding = new Set(cur.keys);
   for (let i = 0; i < NK + 2; i++) {
     const pt = held.has(i) ? 1 : 0;
     press[i] += (pt - press[i]) * (pt ? 0.5 : 0.22);
-    let gt = (i < NK && cur.gate && cur.key === i) ? clamp(0.45 + V.level * 3.2, 0, 1) : 0;
-    if (i === NK && reg === 2) gt = Math.max(gt, 0.9);
-    if (i === NK + 1 && reg === 0) gt = Math.max(gt, 0.9);
+    let gt = (i < NK && sounding.has(i)) ? clamp(0.45 + V.level * 3.2, 0, 1) : 0;
+    if (i >= NK && held.has(i)) gt = 0.95;
     glow[i] += (gt - glow[i]) * (gt > glow[i] ? 0.35 : 0.08);
     const k = keys[i]; keyBuf.set([k.x * dpr, k.y * dpr, k.r * dpr, press[i]], i * 4);
   }
@@ -481,65 +505,83 @@ function frame(ts) {
 }
 
 /* ================= input ================= */
-let hintTimer = 0, hinted = false;
+let hintTimer = 0;
 function showHint() {
   const m = $('#msg');
-  m.innerHTML = T.seen ? '左手で構えて、右手で真珠を押さえる<small>持ち上げると1オクターブ上、ひねると半音上下</small>'
-                       : '真珠を押さえて吹く<small>上下の小さな真珠で音域を変える</small>';
+  let sub = '持ち上げると強く、ひねると半音上下';
+  if (!T.seen) sub = T.denied ? '傾きセンサーが許可されていません' : '';
+  m.innerHTML = '右手で真珠、左手の親指でオクターブ' + (sub ? `<small>${sub}</small>` : '');
   m.classList.remove('off');
-  clearTimeout(hintTimer); hintTimer = setTimeout(() => m.classList.add('off'), 5200);
+  clearTimeout(hintTimer); hintTimer = setTimeout(() => m.classList.add('off'), 5600);
 }
-function start() {
-  if (started) return; started = true;
+// runs on the end of a tap: the only moment iOS lets a page unlock sound and ask for the motion sensor
+function activate() {
+  audio.init(); audio.wake();
+  requestGyro();
+  if (started) return;
+  started = true;
   try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
-  audio.init(); requestGyro();
   try { if (navigator.wakeLock) navigator.wakeLock.request('screen').catch(() => {}); } catch (e) {}
   V.wakeT = 1;
   $('#msg').classList.add('off');
-  setTimeout(() => { if (!hinted) { hinted = true; showHint(); } }, 900);
+  setTimeout(showHint, 1300);
 }
-cv.addEventListener('pointerdown', e => {
-  e.preventDefault();
-  if (!started) { start(); return; }
+function down(id, x, y) {
+  if (!started) return;
   audio.wake();
-  try { cv.setPointerCapture(e.pointerId); } catch (err) {}
-  const k = keyAt(e.clientX, e.clientY);
-  if (k === NK || k === NK + 1) { manualReg = clamp(manualReg + (k === NK ? 1 : -1), 0, 2); P.set(e.pointerId, { key: k, t: performance.now() }); haptic(); compute(); return; }
-  const wasSounding = [...P.values()].some(p => p.key >= 0 && p.key < NK);
-  P.set(e.pointerId, { key: k, t: performance.now() });
-  if (k >= 0) { if (wasSounding) tongue = true; haptic(); }
+  const k = keyAt(x, y);
+  const p = { key: k, voice: null, t: performance.now() };
+  if (k >= 0 && k < NK) p.voice = freeVoice();
+  P.set(id, p);
+  if (k >= 0) haptic();
   compute();
-}, { passive: false });
-cv.addEventListener('pointermove', e => {
-  const p = P.get(e.pointerId); if (!p || p.key >= NK || p.key < 0) return;
-  const k = keyAt(e.clientX, e.clientY);
+}
+function move(id, x, y) {
+  const p = P.get(id); if (!p || p.key < 0 || p.key >= NK) return;
+  const k = keyAt(x, y);
   if (k >= 0 && k < NK && k !== p.key) { p.key = k; p.t = performance.now(); compute(); }
-});
-const end = e => { if (P.delete(e.pointerId)) compute(); };
-cv.addEventListener('pointerup', end); cv.addEventListener('pointercancel', end); cv.addEventListener('lostpointercapture', end);
-cv.addEventListener('touchstart', e => e.preventDefault(), { passive: false });
+}
+function up(id) { if (P.delete(id)) compute(); }
+
+if ('ontouchstart' in window) {
+  const each = (e, fn) => { for (const t of e.changedTouches) fn(t); };
+  cv.addEventListener('touchstart', e => { e.preventDefault(); each(e, t => down(t.identifier, t.clientX, t.clientY)); }, { passive: false });
+  cv.addEventListener('touchmove', e => { e.preventDefault(); each(e, t => move(t.identifier, t.clientX, t.clientY)); }, { passive: false });
+  cv.addEventListener('touchend', e => { e.preventDefault(); each(e, t => up(t.identifier)); activate(); }, { passive: false });
+  cv.addEventListener('touchcancel', e => { each(e, t => up(t.identifier)); }, { passive: false });
+} else {
+  cv.addEventListener('pointerdown', e => { activate(); try { cv.setPointerCapture(e.pointerId); } catch (err) {} down('p' + e.pointerId, e.clientX, e.clientY); });
+  cv.addEventListener('pointermove', e => move('p' + e.pointerId, e.clientX, e.clientY));
+  cv.addEventListener('pointerup', e => up('p' + e.pointerId));
+  cv.addEventListener('pointercancel', e => up('p' + e.pointerId));
+}
 document.addEventListener('contextmenu', e => e.preventDefault());
 document.addEventListener('gesturestart', e => e.preventDefault());
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) { P.clear(); compute(); }
   else if (started) { audio.wake(); if (T.seen) T.center = T.elevS; try { if (navigator.wakeLock) navigator.wakeLock.request('screen').catch(() => {}); } catch (e) {} }
 });
-// keyboard for desk testing: 1-6 play keys, arrows change register
+// keyboard for desk testing: 1-0 play ド..ミ, hold ↑/↓ for the octave keys
 window.addEventListener('keydown', e => {
-  if (!started) return;
+  if (!started || e.repeat) return;
   const i = '1234567890'.indexOf(e.key);
-  if (i >= 0 && !P.has('k' + i)) { const was = [...P.values()].some(p => p.key >= 0 && p.key < NK); P.set('k' + i, { key: NK - 1 - i, t: performance.now() }); if (was) tongue = true; compute(); }
-  if (e.key === 'ArrowUp') { manualReg = clamp(manualReg + 1, 0, 2); compute(); }
-  if (e.key === 'ArrowDown') { manualReg = clamp(manualReg - 1, 0, 2); compute(); }
+  if (i >= 0) { P.set('k' + i, { key: NK - 1 - i, voice: freeVoice(), t: performance.now() }); compute(); }
+  if (e.key === 'ArrowUp') { P.set('ou', { key: OCT_UP, voice: null, t: performance.now() }); compute(); }
+  if (e.key === 'ArrowDown') { P.set('od', { key: OCT_DOWN, voice: null, t: performance.now() }); compute(); }
 });
-window.addEventListener('keyup', e => { const i = '1234567890'.indexOf(e.key); if (i >= 0 && P.delete('k' + i)) compute(); });
+window.addEventListener('keyup', e => {
+  const i = '1234567890'.indexOf(e.key);
+  if (i >= 0) up('k' + i);
+  if (e.key === 'ArrowUp') up('ou');
+  if (e.key === 'ArrowDown') up('od');
+});
 
 window.addEventListener('resize', layout);
 if (screen.orientation) screen.orientation.addEventListener('change', () => setTimeout(layout, 120));
-if (document.fonts) document.fonts.load('54px "Pinyon Script"').then(drawEngraving).catch(() => {});
+if (document.fonts) Promise.all([document.fonts.load('54px "Pinyon Script"'), document.fonts.load('700 14px "Zen Kaku Gothic New"')]).then(drawEngraving).catch(() => {});
 layout();
 requestAnimationFrame(frame);
-window.__iki = { T, P, keys, audio, compute, get cur() { return cur; }, get reg() { return reg; }, start };
+window.__iki = { T, P, keys, audio, compute, activate, get cur() { return cur; }, get oct() { return oct; }, get acc() { return acc; } };
 })();
 </script>
 </body>
